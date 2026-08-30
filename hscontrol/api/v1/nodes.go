@@ -3,6 +3,7 @@ package apiv1
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/netip"
 	"slices"
@@ -409,6 +410,46 @@ func registerNodeWriteOps(api huma.API, b Backend) {
 	})
 }
 
+// approvedRoutesFromRequest validates a route-approval request
+// against the routes the node actually announced and applies the
+// exit-route family coupling. Approvals must never mint reachability
+// the node never offered.
+func approvedRoutesFromRequest(
+	requested []string,
+	announced []netip.Prefix,
+) ([]netip.Prefix, error) {
+	advertised := make(map[netip.Prefix]bool)
+	for _, p := range announced {
+		advertised[p] = true
+	}
+
+	var out []netip.Prefix
+
+	for _, route := range requested {
+		prefix, parseErr := netip.ParsePrefix(route)
+		if parseErr != nil {
+			return nil, huma.Error400BadRequest("parsing route", parseErr)
+		}
+
+		if !advertised[prefix] {
+			return nil, huma.Error400BadRequest(
+				fmt.Sprintf("route %s was not announced by node", prefix.String()))
+		}
+
+		// One exit route implies both families, else the client won't
+		// annotate the node as an exit node.
+		if prefix == tsaddr.AllIPv4() || prefix == tsaddr.AllIPv6() {
+			out = append(out, tsaddr.AllIPv4(), tsaddr.AllIPv6())
+		} else {
+			out = append(out, prefix)
+		}
+	}
+
+	slices.SortFunc(out, netip.Prefix.Compare)
+
+	return slices.Compact(out), nil
+}
+
 func registerNodeAdminOps(api huma.API, b Backend) {
 	huma.Register(api, huma.Operation{
 		OperationID: "setApprovedRoutes",
@@ -423,25 +464,15 @@ func registerNodeAdminOps(api huma.API, b Backend) {
 			return nil, err
 		}
 
-		var newApproved []netip.Prefix
-
-		for _, route := range in.Body.Routes {
-			prefix, parseErr := netip.ParsePrefix(route)
-			if parseErr != nil {
-				return nil, huma.Error400BadRequest("parsing route", parseErr)
-			}
-
-			// One exit route implies both families, else the client won't
-			// annotate the node as an exit node.
-			if prefix == tsaddr.AllIPv4() || prefix == tsaddr.AllIPv6() {
-				newApproved = append(newApproved, tsaddr.AllIPv4(), tsaddr.AllIPv6())
-			} else {
-				newApproved = append(newApproved, prefix)
-			}
+		target, ok := b.State.GetNodeByID(nodeID)
+		if !ok {
+			return nil, huma.Error404NotFound("node not found")
 		}
 
-		slices.SortFunc(newApproved, netip.Prefix.Compare)
-		newApproved = slices.Compact(newApproved)
+		newApproved, err := approvedRoutesFromRequest(in.Body.Routes, target.AnnouncedRoutes())
+		if err != nil {
+			return nil, err
+		}
 
 		node, nodeChange, err := b.State.SetApprovedRoutes(nodeID, newApproved)
 		if err != nil {
